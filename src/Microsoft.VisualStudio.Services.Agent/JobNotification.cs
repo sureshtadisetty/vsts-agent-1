@@ -2,6 +2,8 @@ using Microsoft.VisualStudio.Services.Agent.Util;
 using System;
 using System.IO;
 using System.IO.Pipes;
+using System.Net;
+using System.Net.Sockets;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -14,23 +16,36 @@ namespace Microsoft.VisualStudio.Services.Agent
         Task JobStarted(Guid jobId);
         Task JobCompleted(Guid jobId);
         void StartClient(string pipeName, CancellationToken cancellationToken);
+        void StartClient(string socketAddress);
     }
 
     public sealed class JobNotification : AgentService, IJobNotification
     {
         private NamedPipeClientStream _outClient;
         private StreamWriter _writeStream;
+        private Socket _socket;
         private bool _configured = false;
+        private bool _useSockets = false;
 
         public async Task JobStarted(Guid jobId)
         {
             Trace.Info("Entering JobStarted Notification");
             if (_configured)
             {
-                Trace.Info("Writing JobStarted to pipe");
-                await _writeStream.WriteLineAsync($"Starting job: {jobId.ToString()}");
-                await _writeStream.FlushAsync();
-                Trace.Info("Finished JobStarted writing to pipe");
+                String message = $"Starting job: {jobId.ToString()}";
+                if (_useSockets)
+                {
+                    Trace.Info("Writing JobStarted to socket");
+                    _socket.Send(Encoding.UTF8.GetBytes(message));
+                    Trace.Info("Finished JobStarted writing to pipe");
+                }
+                else
+                {
+                    Trace.Info("Writing JobStarted to pipe");
+                    await _writeStream.WriteLineAsync(message);
+                    await _writeStream.FlushAsync();
+                    Trace.Info("Finished JobStarted writing to pipe");  
+                }
             }
         }
 
@@ -39,10 +54,20 @@ namespace Microsoft.VisualStudio.Services.Agent
             Trace.Info("Entering JobCompleted Notification");
             if (_configured)
             {
-                Trace.Info("Writing JobCompleted to pipe");
-                await _writeStream.WriteLineAsync($"Finished job: {jobId.ToString()}" );
-                await _writeStream.FlushAsync();
-                Trace.Info("Finished JobCompleted writing to pipe");
+                String message = $"Finished job: {jobId.ToString()}";
+                if (_useSockets)
+                {
+                    Trace.Info("Writing JobCompleted to pipe");
+                    _socket.Send(Encoding.UTF8.GetBytes(message));
+                    Trace.Info("Finished JobCompleted writing to pipe");
+                }
+                else
+                {
+                    Trace.Info("Writing JobCompleted to pipe");
+                    await _writeStream.WriteLineAsync(message);
+                    await _writeStream.FlushAsync();
+                    Trace.Info("Finished JobCompleted writing to pipe");
+                }
             }
         }
 
@@ -55,7 +80,54 @@ namespace Microsoft.VisualStudio.Services.Agent
                 await _outClient.ConnectAsync(cancellationToken);
                 _writeStream = new StreamWriter(_outClient, Encoding.UTF8);
                 _configured = true;
-                Trace.Info("Connection successfull to named pipe {0}", pipeName);
+                Trace.Info("Connection successful to named pipe {0}", pipeName);
+            }
+        }
+
+        public void StartClient(String socketAddress)
+        {
+            if (!_configured)
+            {
+                try
+                {
+                    string[] splitAddress = socketAddress.Split(':');
+                    if (splitAddress.Length != 2)
+                    {
+                        Trace.Error("Invalid socket address {0}. Job Notification will be disabled.", socketAddress);
+                        return;
+                    }
+
+                    IPAddress address;
+                    try
+                    {
+                        address = IPAddress.Parse(splitAddress[0]);
+                    }
+                    catch (FormatException e)
+                    {
+                        Trace.Error("Invalid socket ip address {0}. Job Notification will be disabled",splitAddress[0]);
+                        Trace.Error(e);
+                        return;
+                    }
+
+                    int port = -1;
+                    Int32.TryParse(splitAddress[1], out port);
+                    if (port < 1 || port > 65535)
+                    {
+                        Trace.Error("Invalid tcp socket port {0}. Job Notification will be disabled.", splitAddress[1]);
+                        return;
+                    }
+
+                    _socket = new Socket(SocketType.Stream, ProtocolType.Tcp);
+                    _socket.Connect(address, port);
+                    Trace.Info("Connection successful to socket {0}", socketAddress);
+                    _useSockets = true;
+                    _configured = true;
+                }
+                catch (SocketException e)
+                {
+                    Trace.Error("Connection to socket {0} failed!", socketAddress);
+                    Trace.Error(e);
+                }
             }
         }
 
@@ -70,6 +142,8 @@ namespace Microsoft.VisualStudio.Services.Agent
             if (disposing)
             {
                 _outClient?.Dispose();
+                _socket.Send(Encoding.UTF8.GetBytes("<EOF>"));
+                _socket.Shutdown(SocketShutdown.Both);
             }
         }
     }
